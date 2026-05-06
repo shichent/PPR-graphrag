@@ -1,0 +1,109 @@
+import os
+import time
+import json
+import requests
+import re
+import asyncio
+
+from openai import OpenAI, AzureOpenAI, AsyncOpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class LLMCompletionCall:
+    def __init__(self,model_name='deepseek-chat'):
+        self.llm_model = model_name
+        if 'deepseek' in self.llm_model.lower():
+            self.llm_base_url = "https://api.deepseek.com"
+        elif 'gpt' in self.llm_model.lower():
+            self.llm_base_url = "https://api.openai.com/v1"
+        if "gpt" in self.llm_model.lower():
+            self.llm_api_key = os.environ.get("OPENAI_API_KEY", "")
+        elif "deepseek" in self.llm_model.lower():
+            self.llm_api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if not self.llm_api_key:
+            raise ValueError("LLM API key not provided")
+        self.openai_provider = os.getenv("OPENAI_PROVIDER", "openai").lower()
+        self.client = OpenAI(base_url=self.llm_base_url, api_key = self.llm_api_key)
+        self.async_client = AsyncOpenAI(base_url=self.llm_base_url, api_key = self.llm_api_key)
+
+    def call_api(self, content: str) -> str:
+        """
+        Call API to generate text with retry mechanism.
+        
+        Args:
+            content: Prompt content
+            
+        Returns:
+            Generated text response
+        """
+            
+        try:
+            if "gpt-5" in self.llm_model.lower():
+                # No temperature for gpt-5 series
+                completion = self.client.chat.completions.create(
+                    model=self.llm_model,
+                    messages=[{"role": "user", "content": content}],
+                )
+            else:
+                completion = self.client.chat.completions.create(
+                    model=self.llm_model,
+                    messages=[{"role": "user", "content": content}],
+                    temperature=0.3
+                )
+            raw = completion.choices[0].message.content or ""
+            clean_completion = self._clean_llm_content(raw)
+            return clean_completion
+            
+        except Exception as e:
+            print(f"LLM api calling failed. Error: {e}")
+            raise e 
+
+    def _clean_llm_content(self, text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        t = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        t = re.sub(r"[\u200B-\u200D\uFEFF]", "", t)
+        fence_re = re.compile(r"^\s*```(?:\s*\w+)?\s*\n(?P<body>[\s\S]*?)\n\s*```\s*$", re.MULTILINE)
+        m = fence_re.match(t)
+        if m:
+            t = m.group("body").strip()
+        else:
+            if t.startswith("```") and t.endswith("```") and len(t) >= 6:
+                t = t[3:-3].strip()
+
+        if t.lower().startswith("json\n"):
+            t = t.split("\n", 1)[1].strip()
+
+        return t
+    
+    async def async_call_api(self, content: str) -> str:
+        """
+        Asynchronously call API to generate text with retry mechanism.
+        
+        Args:
+            content: Prompt content
+            
+        Returns:
+            Generated text response
+        """
+            
+        try:
+            if "gpt-5" in self.llm_model.lower():
+                completion = await self.async_client.chat.completions.create(
+                    model=self.llm_model,
+                    messages=[{"role": "user", "content": content}],
+                )
+            else:
+                completion = await self.async_client.chat.completions.create(
+                    model=self.llm_model,
+                    messages=[{"role": "user", "content": content}],
+                    temperature=0.3
+                )
+            raw = completion.choices[0].message.content or ""
+            clean_completion = self._clean_llm_content(raw)
+            return clean_completion
+            
+        except Exception as e:
+            print(f"LLM api calling failed. Error: {e}")
+            raise e
