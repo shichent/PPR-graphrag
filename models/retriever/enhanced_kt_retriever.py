@@ -601,227 +601,6 @@ class KTRetriever:
         
         return question_embed, result
 
-    def retrieve_with_type_filtering(self, question: str, involved_types: dict = None) -> Dict:
-        """
-        Enhanced retrieval with type-based filtering followed by similarity search.
-        
-        Args:
-            question: Query question
-            involved_types: Dictionary containing involved schema types
-            
-        Returns:
-            Dictionary containing filtered retrieval results
-        """
-        start_time = time.time()
-        
-        question_embed = self._get_query_embedding(question)
-        query_time = time.time() - start_time
-        
-        if involved_types and any(involved_types.get(k, []) for k in ['nodes', 'relations', 'attributes']):
-            # Use type-based filtering path
-            type_start = time.time()
-            type_filtered_results = self._type_based_retrieval(question_embed, question, involved_types)
-            type_filtering_time = time.time() - type_start
-            logger.info(f"Query encoding: {query_time:.3f}s, Type-based retrieval: {type_filtering_time:.3f}s")
-            
-            return question_embed, type_filtered_results
-        else:
-            question_embed, original_results = self.retrieve(question)
-            logger.info(f"Query encoding: {query_time:.3f}s, Fallback to original retrieval")
-            return question_embed, original_results
-
-    def _type_based_retrieval(self, question_embed: torch.Tensor, question: str, involved_types: dict) -> Dict:
-        """
-        Perform hybrid retrieval: type-filtered node_relation path + original other paths.
-        
-        Args:
-            question_embed: Question embedding tensor
-            question: Original question text
-            involved_types: Dictionary with node types, relations, and attributes
-            
-        Returns:
-            Dictionary containing hybrid retrieval results
-        """
-        if self.recall_paths == 1:
-            # Single path: only filter node_relation path
-            filtered_results = self._type_filtered_node_relation_retrieval(question_embed, question, involved_types)
-            return filtered_results
-        else:
-            # Multi-path: filter only node_relation, keep others original
-            hybrid_results = self._hybrid_type_filtered_retrieval(question_embed, question, involved_types)
-            return hybrid_results
-
-    def _type_filtered_node_relation_retrieval(self, question_embed: torch.Tensor, question: str, involved_types: dict) -> Dict:
-        """
-        Single path retrieval with type filtering only on node_relation path.
-        """
-        target_node_types = involved_types.get('nodes', [])
-        
-        type_filtered_nodes = self._filter_nodes_by_schema_type(target_node_types)
-        
-        if type_filtered_nodes:
-            filtered_node_results = self._similarity_search_on_filtered_nodes(question_embed, type_filtered_nodes)
-            
-            one_hop_triples = self._get_one_hop_triples_from_nodes(filtered_node_results['top_nodes'])
-            
-            chunk_ids = self._extract_chunk_ids_from_nodes(filtered_node_results['top_nodes'])
-            
-            result = {
-                "path1_results": {
-                    "top_nodes": filtered_node_results['top_nodes'],
-                    "one_hop_triples": one_hop_triples
-                },
-                "chunk_ids": list(chunk_ids)
-            }
-        else:
-            result = self._node_relation_retrieval(question_embed, question)
-        
-        return result
-
-    def _hybrid_type_filtered_retrieval(self, question_embed: torch.Tensor, question: str, involved_types: dict) -> Dict:
-        """
-        Multi-path retrieval: type-filtered node_relation + original other paths.
-        """
-        target_node_types = involved_types.get('nodes', [])
-        
-        # Path 1: Type-filtered node_relation retrieval
-        if target_node_types:
-            type_filtered_nodes = self._filter_nodes_by_schema_type(target_node_types)
-            if type_filtered_nodes:
-                path1_results = self._type_filtered_node_relation_path(question_embed, type_filtered_nodes, question=question)
-            else:
-                path1_results = self._node_relation_retrieval(question_embed, question)
-        else:
-            path1_results = self._node_relation_retrieval(question_embed, question)
-        
-        # Path 2: triple-only retrieval
-        path2_results = self._triple_only_retrieval(question_embed)
-        
-        all_chunk_ids = set()
-        path1_chunk_ids = self._extract_chunk_ids_from_nodes(path1_results['top_nodes'])
-        all_chunk_ids.update(path1_chunk_ids)
-        
-        if 'chunk_results' in path2_results and path2_results['chunk_results']:
-            chunk_chunk_ids = set(path2_results['chunk_results'].get('chunk_ids', []))
-            all_chunk_ids.update(chunk_chunk_ids)
-        
-        result = {
-            "path1_results": path1_results,
-            "path2_results": path2_results,
-            "chunk_ids": list(all_chunk_ids)
-        }
-        
-        return result
-
-    def _type_filtered_node_relation_path(self, question_embed: torch.Tensor, filtered_nodes: list, question: str = None) -> Dict:
-        """
-        Execute type-filtered node_relation path.
-        """
-        filtered_node_results = self._similarity_search_on_filtered_nodes(question_embed, filtered_nodes)
-        top_nodes = filtered_node_results['top_nodes']
-
-        ppr_scores = {}
-        if self.use_pagerank and question:
-            keywords = self._extract_query_keywords(question)
-            ppr_scores = self._personalized_pagerank(keywords)
-
-        if self.use_pagerank:
-            all_relations = self._execute_faiss_relation_search(question_embed.cpu().numpy())
-            relation_triples = self._get_relation_matched_triples(top_nodes, all_relations)
-            ppr_candidates = []
-            if ppr_scores:
-                for u, v, data in self.graph.edges(data=True):
-                    su = ppr_scores.get(u, 0.0)
-                    sv = ppr_scores.get(v, 0.0)
-                    if su > 0 and sv > 0:
-                        rel = data.get('relation', '')
-                        if rel:
-                            ppr_candidates.append((u, rel, v))
-            one_hop_triples = list(set(relation_triples) | set(ppr_candidates))
-        else:
-            one_hop_triples = self._get_one_hop_triples_from_nodes(top_nodes)
-
-        return {
-            "top_nodes": top_nodes,
-            "one_hop_triples": one_hop_triples,
-            "ppr_scores": ppr_scores
-        }
-
-    def _similarity_search_on_filtered_nodes(self, question_embed: torch.Tensor, filtered_nodes: list) -> Dict:
-        """
-        Perform similarity search only on filtered nodes.
-        """
-        if not filtered_nodes:
-            return {"top_nodes": []}
-        
-        filtered_node_embeddings = []
-        filtered_node_map = {}
-        
-        for idx, node_id in enumerate(filtered_nodes):
-            if node_id in self.faiss_retriever.node_map.values():
-                # Find the original index of this node in the FAISS index
-                original_idx = None
-                for orig_idx, orig_node_id in self.faiss_retriever.node_map.items():
-                    if orig_node_id == node_id:
-                        original_idx = orig_idx
-                        break
-                
-                if original_idx is not None:
-                    node_embedding = self.faiss_retriever.node_index.reconstruct(int(original_idx))
-                    filtered_node_embeddings.append(node_embedding)
-                    filtered_node_map[len(filtered_node_embeddings) - 1] = node_id
-        
-        if filtered_node_embeddings:
-            filtered_embeddings_array = np.array(filtered_node_embeddings).astype('float32')
-            temp_index = faiss.IndexFlatIP(filtered_embeddings_array.shape[1])
-            temp_index.add(filtered_embeddings_array)
-            
-            search_k = min(self.top_k_graph, len(filtered_node_embeddings))
-            _, indices = temp_index.search(question_embed.reshape(1, -1), search_k)
-
-            top_filtered_nodes = [filtered_node_map[idx] for idx in indices[0] if idx in filtered_node_map]
-        else:
-            top_filtered_nodes = filtered_nodes[:self.top_k_graph]
-        
-        return {"top_nodes": top_filtered_nodes}
-
-    def _get_one_hop_triples_from_nodes(self, node_list: list) -> list:
-
-        one_hop_triples = []
-        node_set = set(node_list)
-
-        for u, v, data in self.graph.edges(data=True):
-            if u in node_set or v in node_set:
-                relation = data.get('relation', '')
-                one_hop_triples.append((u, relation, v))
-
-        return one_hop_triples[:self.top_k_graph]
-
-    def _filter_nodes_by_schema_type(self, target_types: list) -> list:
-        """
-        Filter nodes based on their schema_type property.
-        
-        Args:
-            target_types: List of target schema types
-            
-        Returns:
-            List of filtered node IDs
-        """
-        if not target_types:
-            return list(self.graph.nodes())
-        
-        filtered_nodes = []
-        for node_id, node_data in self.graph.nodes(data=True):
-            node_properties = node_data.get('properties', {})
-            node_schema_type = node_properties.get('schema_type', '')
-            
-            if node_schema_type in target_types:
-                filtered_nodes.append(node_id)
-            # Also include nodes without schema_type for backward compatibility
-            elif not node_schema_type and node_data.get('label') == 'entity':
-                filtered_nodes.append(node_id)
-
-        return filtered_nodes
 
     def _get_node_name(self, node_id: str) -> str:
         """Get the name property of a node."""
@@ -1112,16 +891,7 @@ class KTRetriever:
 
             if self.use_pagerank:
                 relation_triples = self._get_relation_matched_triples(top_nodes, all_relations)
-                ppr_candidates = []
-                if pagerank_scores:
-                    for u, v, data in self.graph.edges(data=True):
-                        su = pagerank_scores.get(u, 0.0)
-                        sv = pagerank_scores.get(v, 0.0)
-                        if su > 0 and sv > 0:
-                            rel = data.get('relation', '')
-                            if rel:
-                                ppr_candidates.append((u, rel, v))
-                all_triples = list(set(relation_triples) | set(ppr_candidates))
+                all_triples = relation_triples
             else:
                 expansion_start = time.time()
                 future_path_triples = executor.submit(
@@ -1148,11 +918,14 @@ class KTRetriever:
 
             chunk_results = future_chunk_retrieval.result()
 
+        extracted_keywords = future_keywords.result() if future_keywords else []
+
         return {
             "top_nodes": top_nodes,
             "top_relations": all_relations,
             "one_hop_triples": all_triples,
             "ppr_scores": pagerank_scores,
+            "keywords": extracted_keywords,
             "chunk_results": chunk_results
         }
 
@@ -1190,15 +963,20 @@ class KTRetriever:
             keywords = list(future_keywords)
         if not keywords:
             return {}
+        keywords = list(set(keywords))
 
         personalization = {}
         for node_id in self.graph.nodes():
             props = self.graph.nodes[node_id].get('properties', {})
             node_name = props.get('name', '').lower()
             for kw in keywords:
-                if kw.lower() in node_name or node_name in kw.lower():
+                if kw.lower() == node_name:
                     personalization[node_id] = personalization.get(node_id, 0.0) + 1.0
                     break
+                elif kw.lower() in node_name:
+                    personalization[node_id] = personalization.get(node_id, 0.0) + 0.1
+                    if personalization[node_id] >= 1.0:
+                        break
 
         if not personalization:
             return {}
@@ -1206,6 +984,11 @@ class KTRetriever:
         try:
             scores = nx.pagerank(self.graph, alpha=self.pagerank_alpha,
                                  personalization=personalization, max_iter=100)
+            logger.info(f"PPR scores generated: {len(scores)} nodes")
+            top_ppr = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
+            for rank, (node_id, ppr_score) in enumerate(top_ppr, 1):
+                node_name = self.graph.nodes[node_id].get('properties', {}).get('name', node_id)
+                logger.info(f"  PPR top-{rank}: {node_name} ({node_id}) = {ppr_score:.6f}")
             return scores
         except Exception as e:
             logger.warning(f"PageRank failed: {e}")
@@ -1548,34 +1331,38 @@ class KTRetriever:
         return formatted_results, chunk_id_set
     
     def _collect_all_scored_triples(self, results: Dict, question_embed: torch.Tensor) -> List[Tuple[str, str, str, float]]:
-        """Collect and merge all scored triples from both paths, combining FAISS score with PPR component."""
-        all_scored_triples = []
+        """Collect triples from three independent tracks: FAISS triples, FAISS node one-hop, PPR.
+
+        Each track scores triples by its own metric. Final combined score (FAISS + PPR) is
+        applied later in process_retrieval_results, right before formatting for the agent.
+        """
         ppr_scores = results['path1_results'].get('ppr_scores', {})
 
-        def _add_ppr(scored: List[Tuple[str, str, str, float]]) -> List[Tuple[str, str, str, float]]:
-            if not ppr_scores:
-                return scored
-            return [
-                (h, r, t, score + 100.0 * ppr_scores.get(h, 0.0) * ppr_scores.get(t, 0.0))
-                for h, r, t, score in scored
-            ]
+        # Track 2: FAISS triple search — scored by FAISS inner-product similarity
+        path2_scored: List[Tuple[str, str, str, float]] = results['path2_results'].get('scored_triples', [])
 
-        path2_scored = results['path2_results'].get('scored_triples', [])
-        if path2_scored:
-            all_scored_triples.extend(_add_ppr(path2_scored))
-
+        # Track 1: FAISS node search → one-hop triples — scored by cosine similarity to question
         path1_triples = results['path1_results'].get('one_hop_triples', [])
-        if path1_triples:
-            path1_scored = self._rerank_triples_by_relevance(path1_triples, question_embed)
-            all_scored_triples.extend(_add_ppr(path1_scored))
+        path1_scored = self._rerank_triples_by_relevance(path1_triples, question_embed) if path1_triples else []
 
+        # Track 3: PPR track — scored by ppr(h) * ppr(t)
+        ppr_track = self._ppr_track_retrieval(ppr_scores)
+
+        # Merge: deduplicate by keeping highest per-track score for each (h, r, t)
+        best: Dict[Tuple[str, str, str], float] = {}
+        for h, r, t, score in path2_scored + path1_scored + ppr_track:
+            key = (h, r, t)
+            if score > best.get(key, -1.0):
+                best[key] = score
+
+        all_scored_triples = [(h, r, t, score) for (h, r, t), score in best.items()]
         all_scored_triples.sort(key=lambda x: x[3], reverse=True)
         return all_scored_triples
     
-    def _format_scored_triples(self, scored_triples: List[Tuple[str, str, str, float]]) -> List[str]:
+    def _format_scored_triples(self, scored_triples: List[Tuple[str, str, str, float]], ppr_scores: Dict[str, float] = None) -> List[str]:
         """Format scored triples into readable text with node properties."""
         formatted_triples = []
-        
+
         for h, r, t, score in scored_triples:
             head_text = self._get_node_text(h)
             tail_text = self._get_node_text(t)
@@ -1585,10 +1372,39 @@ class KTRetriever:
 
             if "represented_by" == r or "kw_filter_by" == r:
                 continue
-            formatted_triples.append(f"({head_text}, {r}, {tail_text}) [score: {score:.3f}]")
+            if ppr_scores is not None:
+                ppr_component = 400.0 * ppr_scores.get(h, 0.0) * ppr_scores.get(t, 0.0)
+                faiss_component = score - ppr_component
+                formatted_triples.append(f"({head_text}, {r}, {tail_text}) [FAISS:{faiss_component:.3f}, PPR:{ppr_component:.3f}]")
+            else:
+                formatted_triples.append(f"({head_text}, {r}, {tail_text}) [score: {score:.3f}]")
 
         return formatted_triples
-    
+
+    def rerank_and_format_triples(
+        self,
+        raw_triples: dict,
+        ppr_scores: dict,
+        top_k: int,
+        question: str
+    ) -> List[str]:
+        """Re-rank accumulated triples using fully fresh scores for the current query.
+
+        Both FAISS similarity (recomputed from question embedding) and PPR (from
+        ppr_scores for the current query) are equally weighted components of the
+        combined score. Stored base scores from prior retrievals are discarded.
+        """
+        if not raw_triples:
+            return []
+        question_embed = self.qa_encoder.encode(question, convert_to_tensor=True).to(self.device)
+        freshly_scored = self._rerank_triples_by_relevance(list(raw_triples.keys()), question_embed)
+        combined = [
+            (h, r, t, faiss_score + 400.0 * ppr_scores.get(h, 0.0) * ppr_scores.get(t, 0.0))
+            for h, r, t, faiss_score in freshly_scored
+        ]
+        combined.sort(key=lambda x: x[3], reverse=True)
+        return self._format_scored_triples(combined[:top_k], ppr_scores if ppr_scores else None)
+
     def _extract_chunk_ids_from_triples(self, scored_triples: List[Tuple[str, str, str, float]]) -> set:
         """Extract chunk IDs from node properties and edge data in scored triples."""
         chunk_ids = set()
@@ -1613,8 +1429,34 @@ class KTRetriever:
 
         return chunk_ids
 
+    def _extract_chunk_scores_from_triples(
+        self, scored_triples: List[Tuple[str, str, str, float]]
+    ) -> Dict[str, float]:
+        """Map each chunk ID to the max combined triple score from its associated triples."""
+        chunk_scores: Dict[str, float] = {}
+        for h, r, t, score in scored_triples:
+            cids: set = set()
+            if h in self.graph.nodes:
+                for cid in self._get_node_chunk_id(self.graph.nodes[h]):
+                    cids.add(str(cid))
+            if t in self.graph.nodes:
+                for cid in self._get_node_chunk_id(self.graph.nodes[t]):
+                    cids.add(str(cid))
+            edge_data = self.graph.get_edge_data(h, t)
+            if edge_data:
+                for edata in edge_data.values():
+                    if edata.get('relation') == r:
+                        raw = edata.get('chunk_id', [])
+                        ids = raw if isinstance(raw, list) else ([raw] if raw is not None else [])
+                        for cid in ids:
+                            cids.add(str(cid))
+            for cid in cids:
+                chunk_scores[cid] = max(chunk_scores.get(cid, 0.0), score)
+        return chunk_scores
+
     def _rank_chunk_ids_by_similarity(
-        self, chunk_ids: set, question_embed: torch.Tensor, top_k: int
+        self, chunk_ids: set, question_embed: torch.Tensor, top_k: int,
+        chunk_triple_scores: Dict[str, float] = None
     ) -> set:
         if not chunk_ids or self.chunk_faiss_index is None:
             return chunk_ids
@@ -1628,6 +1470,8 @@ class KTRetriever:
             try:
                 emb = self.chunk_faiss_index.reconstruct(int(idx))
                 sim = float(np.dot(q, emb))
+                if chunk_triple_scores is not None:
+                    sim += chunk_triple_scores.get(str(chunk_id), 0.0)
                 scored.append((chunk_id, sim))
             except Exception:
                 continue
@@ -1661,58 +1505,67 @@ class KTRetriever:
             logger.error(f"Total {fail_counter} chunks missing.")
         return {chunk_id:self.chunk2id[chunk_id] for chunk_id in chunk_ids if chunk_id in self.chunk2id}
 
-    def process_retrieval_results(self, question: str, involved_types: dict = None) -> Tuple[Dict, float]:
+    def process_retrieval_results(self, question: str) -> Tuple[Dict, float]:
         """Process retrieval results with optimized structure and helper methods."""
         start_time = time.time()
-        
-        if involved_types:
-            question_embed, results = self.retrieve_with_type_filtering(question, involved_types)
-        else:
-            question_embed, results = self.retrieve(question)
+
+        question_embed, results = self.retrieve(question)
 
         retrieval_time = time.time() - start_time
         logger.info(f"retrieval time: {retrieval_time:.4f}")
 
-        # path1_triples = self._extract_triple_based_info(results['path1_results']['one_hop_triples'])
-        
-        # path2_triples = []
-        # if results['path2_results'].get('scored_triples'):
-        #     path2_triples = self._extract_scored_triple_info(results['path2_results']['scored_triples'])
-        
-        # Merge entity attributes for both paths
-        # merged_path1 = self._merge_entity_attributes(path1_triples)
-        # merged_path2 = self._merge_entity_attributes(path2_triples)
-        # all_triples = merged_path1 + merged_path2
-        
         chunk_results = results['path1_results'].get('chunk_results')
         chunk_retrieval_results, chunk_retrieval_ids = self._process_chunk_results(
             chunk_results, question_embed, self.top_k_chunks
         )
 
-        all_scored_triples = self._collect_all_scored_triples(results, question_embed)
-        limited_scored_triples = all_scored_triples[:self.top_k_graph]
-        
+        raw_scored_triples = self._collect_all_scored_triples(results, question_embed)
+
+        # Combine FAISS similarity score and PPR score — two equal components of the final triple score
+        ppr_scores = results['path1_results'].get('ppr_scores', {})
+        if ppr_scores:
+            combined = [
+                (h, r, t, score + 400.0 * ppr_scores.get(h, 0.0) * ppr_scores.get(t, 0.0))
+                for h, r, t, score in raw_scored_triples
+            ]
+            combined.sort(key=lambda x: x[3], reverse=True)
+        else:
+            combined = raw_scored_triples
+
+        limited_scored_triples = combined[:self.top_k_graph]
+
         # Format triples and extract chunk IDs
-        formatted_triples = self._format_scored_triples(limited_scored_triples)
+        formatted_triples = self._format_scored_triples(limited_scored_triples, ppr_scores if ppr_scores else None)
         triple_chunk_ids_raw = self._extract_chunk_ids_from_triples(limited_scored_triples)
-        triple_chunk_ids = self._rank_chunk_ids_by_similarity(
-            triple_chunk_ids_raw, question_embed, self.top_k_chunks
-        )
+        if self.use_pagerank and ppr_scores:
+            chunk_triple_scores = self._extract_chunk_scores_from_triples(limited_scored_triples)
+            triple_chunk_ids = self._rank_chunk_ids_by_similarity(
+                triple_chunk_ids_raw, question_embed, self.top_k_chunks, chunk_triple_scores
+            )
+        else:
+            triple_chunk_ids = self._rank_chunk_ids_by_similarity(
+                triple_chunk_ids_raw, question_embed, self.top_k_chunks
+            )
         logger.info(f"Triple chunk IDs: {len(triple_chunk_ids_raw)} raw -> {len(triple_chunk_ids)} after ranking/cap")
 
         all_chunk_ids = chunk_retrieval_ids | triple_chunk_ids
         matching_chunks = self._get_matching_chunks(all_chunk_ids)
-        
+
+        keywords = results['path1_results'].get('keywords', [])
+
         retrieval_results = {
             'triples': formatted_triples,
+            'raw_scored_triples': raw_scored_triples,
+            'ppr_scores': ppr_scores,
+            'keywords': keywords,
             'chunk_ids': list(all_chunk_ids),
             'chunk_contents': matching_chunks,
             'chunk_retrieval_results': chunk_retrieval_results
         }
-        
+
         return retrieval_results, retrieval_time
 
-    def process_subquestions_parallel(self, sub_questions: List[Dict], involved_types: dict = None) -> Tuple[Dict, float]:
+    def process_subquestions_parallel(self, sub_questions: List[Dict]) -> Tuple[Dict, float]:
         """
         Args:
             sub_questions: List of sub-question dictionaries
@@ -1721,38 +1574,42 @@ class KTRetriever:
             Tuple of (aggregated_results, total_time)
         """
         start_time = time.time()
-        
+
         default_max_workers = 4
         if self.config:
             default_max_workers = self.config.retrieval.faiss.max_workers
         max_workers = min(len(sub_questions), default_max_workers)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
 
+        lock = threading.Lock()
+        all_raw_triples: dict = {}
+        all_keywords: List[str] = []
+        all_chunk_ids: set = set()
+        all_chunk_contents: dict = {}
+        all_sub_question_results: list = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_subquestion = {
-                executor.submit(self._process_single_subquestion, sub_q, involved_types): sub_q
+                executor.submit(self._process_single_subquestion, sub_q): sub_q
                 for sub_q in sub_questions
             }
-            all_triples = set()
-            all_chunk_ids = set()
-            all_chunk_contents = {}
-            all_sub_question_results = []
-            
             for future in concurrent.futures.as_completed(future_to_subquestion):
                 sub_q = future_to_subquestion[future]
                 try:
                     sub_result = future.result()
-                    
-                    with threading.Lock():
-                        all_triples.update(sub_result['triples'])
+                    with lock:
+                        for (h, r, t), score in sub_result['raw_triples'].items():
+                            if score > all_raw_triples.get((h, r, t), -1.0):
+                                all_raw_triples[(h, r, t)] = score
+                        kw = sub_result.get('keywords', [])
+                        if kw:
+                            all_keywords = list(set(all_keywords + kw))
                         all_chunk_ids.update(sub_result['chunk_ids'])
-                        
                         for chunk_id, content in sub_result['chunk_contents'].items():
                             all_chunk_contents[chunk_id] = content
-                        
                         all_sub_question_results.append(sub_result['sub_result'])
                 except Exception as e:
                     logger.error(f"Error processing sub-question: {str(e)}")
-                    with threading.Lock():
+                    with lock:
                         all_sub_question_results.append({
                             'sub_question': sub_q.get('sub-question', ''),
                             'triples_count': 0,
@@ -1760,62 +1617,69 @@ class KTRetriever:
                             'time_taken': 0.0
                         })
 
-        dedup_triples = list(all_triples) 
-        dedup_chunk_ids = list(all_chunk_ids)  
-        
-        dedup_chunk_contents = {chunk_id: all_chunk_contents.get(chunk_id, f"[Missing content for chunk {chunk_id}]") 
-                               for chunk_id in dedup_chunk_ids}
+        dedup_chunk_ids = list(all_chunk_ids)
+        dedup_chunk_contents = {
+            chunk_id: all_chunk_contents.get(chunk_id, f"[Missing content for chunk {chunk_id}]")
+            for chunk_id in dedup_chunk_ids
+        }
 
-        if not dedup_triples and not dedup_chunk_contents:
-            dedup_triples = ["No relevant information found"]
+        if not all_raw_triples and not dedup_chunk_contents:
             dedup_chunk_contents = {"no_chunks": "No relevant chunks found"}
-        
+
         total_time = time.time() - start_time
-        
+
         return {
-            'triples': dedup_triples,
+            'raw_triples': all_raw_triples,
+            'ppr_scores': {},
+            'keywords': all_keywords,
             'chunk_ids': dedup_chunk_ids,
             'chunk_contents': dedup_chunk_contents,
             'sub_question_results': all_sub_question_results
         }, total_time
 
-    def _process_single_subquestion(self, sub_question: Dict, involved_types: dict = None) -> Dict:
+    def _process_single_subquestion(self, sub_question: Dict) -> Dict:
 
         sub_question_text = sub_question.get('sub-question', '')
         try:
-            retrieval_results, time_taken = self.process_retrieval_results(sub_question_text, involved_types)
-            triples = retrieval_results.get('triples', []) or []
+            retrieval_results, time_taken = self.process_retrieval_results(sub_question_text)
+            raw_scored_triples = retrieval_results.get('raw_scored_triples', []) or []
+            ppr_scores = retrieval_results.get('ppr_scores', {}) or {}
+            keywords = retrieval_results.get('keywords', []) or []
             chunk_ids = retrieval_results.get('chunk_ids', []) or []
             chunk_contents = retrieval_results.get('chunk_contents', {}) or {}
-            
-            if not isinstance(triples, (list, tuple)):
-                logger.warning(f"triples is not a list: {type(triples)}")
-                triples = []
+
             if not isinstance(chunk_ids, (list, tuple)):
-                logger.warning(f"chunk_ids is not a list: {type(chunk_ids)}")
                 chunk_ids = []
             if not isinstance(chunk_contents, dict):
-                logger.warning(f"chunk_contents is not a dict: {type(chunk_contents)}")
                 chunk_contents = {}
-            
+
+            raw_triples: dict = {}
+            for h, r, t, score in raw_scored_triples:
+                if score > raw_triples.get((h, r, t), -1.0):
+                    raw_triples[(h, r, t)] = score
+
             sub_result = {
                 'sub_question': sub_question_text,
-                'triples_count': len(triples),
+                'triples_count': len(raw_triples),
                 'chunk_ids_count': len(chunk_ids),
                 'time_taken': time_taken
             }
 
             return {
-                'triples': set(triples),
+                'raw_triples': raw_triples,
+                'ppr_scores': ppr_scores,
+                'keywords': keywords,
                 'chunk_ids': set(chunk_ids),
                 'chunk_contents': chunk_contents,
                 'sub_result': sub_result
             }
-            
+
         except Exception as e:
             logger.error(f"Error processing sub-question '{sub_question_text}': {str(e)}")
             return {
-                'triples': set(),
+                'raw_triples': {},
+                'ppr_scores': {},
+                'keywords': [],
                 'chunk_ids': set(),
                 'chunk_contents': {},
                 'sub_result': {
@@ -2089,6 +1953,22 @@ class KTRetriever:
         
         return [node for node, score in sorted_neighbors[:max_neighbors] if score > 0.1]
 
+    def _ppr_track_retrieval(self, ppr_scores: Dict[str, float]) -> List[Tuple[str, str, str, float]]:
+        """PPR retrieval track: edges where both nodes have PPR > 0, scored by ppr(h) * ppr(t)."""
+        if not ppr_scores:
+            return []
+        ppr_triples = []
+        for u, v, data in self.graph.edges(data=True):
+            su = ppr_scores.get(u, 0.0)
+            sv = ppr_scores.get(v, 0.0)
+            if su > 0 and sv > 0:
+                rel = data.get('relation', '')
+                if rel and rel not in ('represented_by', 'kw_filter_by'):
+                    ppr_triples.append((u, rel, v, su * sv))
+        ppr_triples.sort(key=lambda x: x[3], reverse=True)
+        logger.info(f"PPR track: {len(ppr_triples)} candidate triples, returning top {self.top_k_graph}")
+        return ppr_triples[:self.top_k_graph]
+
     def _rerank_triples_by_relevance(self, triples: List[Tuple[str, str, str]], question_embed: torch.Tensor) -> List[Tuple[str, str, str, float]]:
         """
         Optimized triple reranking with batch encoding and enhanced caching
@@ -2222,7 +2102,10 @@ class KTRetriever:
 
             
         elif method == "gliner":
-            question = re.sub(r'([\u0080-\uFFFF])', r' \1', question)
+            # 1. Add spaces around the characters
+            question = re.sub(r'([\u0080-\uFFFF])', r' \1 ', question)
+            # 2. Replace multiple spaces with a single space and trim the ends
+            question = re.sub(r'\s+', ' ', question).strip()
             schema = self.read_schema(self.schema_path)
             labels = schema["Nodes"]
             entities = self.gliner_model.predict_entities(question, labels, threshold=0.05)

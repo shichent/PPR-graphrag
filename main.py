@@ -67,6 +67,15 @@ def merge_chunk_contents(chunk_ids, chunk_contents_dict):
     return [chunk_contents_dict.get(chunk_id, f"[Missing content for chunk {chunk_id}]") for chunk_id in chunk_ids]
 
 
+def filter_by_entities(items: List[str], entities: List[str]) -> List[str]:
+    """Keep only items containing at least one entity as a substring (case-insensitive).
+    Returns items unchanged when entities is empty."""
+    if not entities:
+        return items
+    entities_lower = [e.lower() for e in entities]
+    return [item for item in items if any(e in item.lower() for e in entities_lower)]
+
+
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Youtu-GraphRAG Framework")
@@ -222,31 +231,34 @@ def initial_question_decomposition(graphq, kt_retriever, question, schema_path):
     Returns:
         dict: Contains decomposition_result, retrieval_results, and initial_answer
     """
-    all_triples = set()
+    all_raw_triples: dict = {}   # (h, r, t) -> max base_score
+    latest_ppr_scores: dict = {}
+    all_keywords: List[str] = []
     all_chunk_ids = set()
     all_chunk_contents = dict()
     all_sub_question_results = []
     total_time = 0
+    decomposition_result = {}
 
     try:
         decomposition_result = graphq.decompose(question, schema_path)
         sub_questions = decomposition_result.get("sub_questions", [])
-        involved_types = decomposition_result.get("involved_types", {})
         logger.info(f"Original question: {question}")
         logger.info(f"Decomposed into {len(sub_questions)} sub-questions")
-        logger.info(f"Involved types: {involved_types}")
     except Exception as e:
         logger.error(f"Error decomposing question: {str(e)}")
         sub_questions = [{"sub-question": question}]
-        involved_types = {"nodes": [], "relations": [], "attributes": []}  
 
     if len(sub_questions) > 1:
         logger.info("🚀 Using parallel sub-question processing...")
-        aggregated_results, parallel_time = kt_retriever.process_subquestions_parallel(
-            sub_questions, involved_types=involved_types
-        )
+        aggregated_results, parallel_time = kt_retriever.process_subquestions_parallel(sub_questions)
         total_time += parallel_time
-        all_triples.update(aggregated_results['triples'])
+        for (h, r, t), score in aggregated_results['raw_triples'].items():
+            if score > all_raw_triples.get((h, r, t), -1.0):
+                all_raw_triples[(h, r, t)] = score
+        kw = aggregated_results.get('keywords', [])
+        if kw:
+            all_keywords = list(set(all_keywords + kw))
         all_chunk_ids.update(aggregated_results['chunk_ids'])
         for chunk_id, content in aggregated_results['chunk_contents'].items():
             all_chunk_contents[chunk_id] = content
@@ -259,67 +271,59 @@ def initial_question_decomposition(graphq, kt_retriever, question, schema_path):
             try:
                 sub_question_text = sub_question["sub-question"]
                 logger.info(f"Processing sub-question {i+1}: {sub_question_text}")
-                retrieval_results, time_taken = kt_retriever.process_retrieval_results(sub_question_text, involved_types=involved_types)
+                retrieval_results, time_taken = kt_retriever.process_retrieval_results(sub_question_text)
                 total_time += time_taken
-                triples = retrieval_results.get('triples', []) or []
+                for h, r, t, score in retrieval_results.get('raw_scored_triples', []):
+                    if score > all_raw_triples.get((h, r, t), -1.0):
+                        all_raw_triples[(h, r, t)] = score
+                kw = retrieval_results.get('keywords', [])
+                if kw:
+                    all_keywords = list(set(all_keywords + kw))
                 chunk_ids = retrieval_results.get('chunk_ids', []) or []
                 chunk_contents = retrieval_results.get('chunk_contents', {}) or {}
-                sub_result = {
+                all_sub_question_results.append({
                     'sub_question': sub_question_text,
-                    'triples_count': len(triples),
+                    'triples_count': len(all_raw_triples),
                     'chunk_ids_count': len(chunk_ids),
                     'time_taken': time_taken
-                }
-                all_sub_question_results.append(sub_result)
-                all_triples.update(triples)
+                })
                 all_chunk_ids.update(chunk_ids)
-                if isinstance(chunk_contents, dict):
-                    for chunk_id, content in chunk_contents.items():
-                        all_chunk_contents[chunk_id] = content
-                else:
-                    for i, chunk_id in enumerate(chunk_ids):
-                        if i < len(chunk_contents):
-                            all_chunk_contents[chunk_id] = chunk_contents[i]
-                        else:
-                            logger.debug(f"Missing chunk content for chunk_id {chunk_id}")
-
-                logger.info(f"Sub-question {i+1} results: {len(retrieval_results['triples'])} triples, {len(retrieval_results['chunk_ids'])} chunks")
+                for chunk_id, content in chunk_contents.items():
+                    all_chunk_contents[chunk_id] = content
+                logger.info(f"Sub-question {i+1} results: {len(all_raw_triples)} triples, {len(chunk_ids)} chunks")
 
             except Exception as e:
                 logger.error(f"Error processing sub-question {i+1}: {str(e)}")
-                sub_result = {
-                    'sub_question': sub_question_text,
+                all_sub_question_results.append({
+                    'sub_question': sub_question.get("sub-question", ""),
                     'triples_count': 0,
                     'chunk_ids_count': 0,
                     'time_taken': 0.0
-                }
-                all_sub_question_results.append(sub_result)
+                })
                 continue
             
-    dedup_triples = deduplicate_triples(list(all_triples))
-    dedup_chunk_ids = list(set(all_chunk_ids))
+    if kt_retriever.use_pagerank and all_keywords:
+        latest_ppr_scores = kt_retriever._personalized_pagerank(all_keywords)
+        logger.info(f"Combined-keywords PPR computed over {len(all_keywords)} keywords")
+
+    dedup_chunk_ids = list(all_chunk_ids)
     dedup_chunk_contents = all_chunk_contents
-
-    if len(dedup_triples) > 20: 
-        question_separated = re.sub(r'([\u0080-\uFFFF])', r' \1', question) # Separate non-ASCII characters with spaces to improve keyword matching 
-        question_keywords = set(question_separated.lower().split())
-        scored_triples = []
-        for triple in dedup_triples:
-            triple_lower = triple.lower()
-            score = sum(1 for keyword in question_keywords if keyword in triple_lower)
-            scored_triples.append((triple, score))
-
-        scored_triples.sort(key=lambda x: x[1], reverse=True)
-        dedup_triples = [triple for triple, score in scored_triples[:config.retrieval.top_k_graph]]
-
     if len(dedup_chunk_contents) > config.retrieval.top_k_chunks:
         dedup_chunk_contents = rerank_chunks_by_keywords(dedup_chunk_contents, question, config.retrieval.top_k_chunks)
         dedup_chunk_ids = list(dedup_chunk_contents.keys())
     dedup_chunk_contents_list = list(dedup_chunk_contents.values())
+
+    dedup_triples = kt_retriever.rerank_and_format_triples(
+        all_raw_triples, latest_ppr_scores, config.retrieval.top_k_graph, question
+    )
+    dedup_triples = filter_by_entities(dedup_triples, all_keywords)
+    dedup_chunk_contents_list = filter_by_entities(dedup_chunk_contents_list, all_keywords)
+
     if not dedup_triples and not dedup_chunk_contents:
         logger.warning(f"No triples or chunks retrieved for question: {question}")
         dedup_triples = ["No relevant information found"]
         dedup_chunk_contents_list = ["No relevant chunks found"]
+
     context = "=== Triples ===\n" + "\n".join(dedup_triples)
     context += "\n=== Chunks ===\n" + "\n".join(dedup_chunk_contents_list)
 
@@ -344,7 +348,9 @@ def initial_question_decomposition(graphq, kt_retriever, question, schema_path):
     return {
         'decomposition_result': decomposition_result,
         'sub_questions': sub_questions,
-        'involved_types': involved_types,
+        'raw_triples': all_raw_triples,
+        'ppr_scores': latest_ppr_scores,
+        'keywords': all_keywords,
         'triples': dedup_triples,
         'chunk_ids': dedup_chunk_ids,
         'chunk_contents': dedup_chunk_contents,
@@ -389,7 +395,9 @@ def agent_retrieval(graphq, kt_retriever, qa_pairs, schema_path):
         step = 1
         current_query = qa["question"]
         thoughts = []
-        all_triples = set()
+        all_raw_triples: dict = {}
+        latest_ppr_scores: dict = {}
+        latest_keywords: List[str] = []
         all_chunk_ids = set()
         all_chunk_contents = dict()
         logs = []
@@ -402,9 +410,17 @@ def agent_retrieval(graphq, kt_retriever, qa_pairs, schema_path):
         total_time += initial_result['total_time']
         
         # Use noagent results as initial knowledge base
-        all_triples.update(initial_result['triples'])
+        for (h, r, t), score in initial_result.get('raw_triples', {}).items():
+            if score > all_raw_triples.get((h, r, t), -1.0):
+                all_raw_triples[(h, r, t)] = score
+        ppr = initial_result.get('ppr_scores', {})
+        if ppr:
+            latest_ppr_scores = ppr
+        kw = initial_result.get('keywords', [])
+        if kw:
+            latest_keywords = kw
         all_chunk_ids.update(initial_result['chunk_ids'])
-        all_chunk_contents = initial_result['chunk_contents']  # Assuming this is already a dict
+        all_chunk_contents = initial_result['chunk_contents']
         
         # Use noagent answer as initial thought
         initial_thought = f"Initial analysis (noagent mode): {initial_result['initial_answer']}"
@@ -418,37 +434,51 @@ def agent_retrieval(graphq, kt_retriever, qa_pairs, schema_path):
         while step <= max_steps:
             logger.info(f"📝 IRCoT Step {step}/{max_steps}")
             
-            dedup_triples = deduplicate_triples(list(all_triples))
-            dedup_chunk_ids = list(set(all_chunk_ids))
+            dedup_triples = kt_retriever.rerank_and_format_triples(
+                all_raw_triples, latest_ppr_scores, config.retrieval.top_k_graph, current_query
+            )
+            dedup_triples = filter_by_entities(dedup_triples, latest_keywords)
+            dedup_chunk_ids = list(all_chunk_ids)
             dedup_chunk_contents = all_chunk_contents
-            dedup_chunk_contents_list = list(all_chunk_contents.values())
-            
+            dedup_chunk_contents_list = filter_by_entities(list(all_chunk_contents.values()), latest_keywords)
+
             context = "=== Triples ===\n" + "\n".join(dedup_triples)
             context += "\n=== Chunks ===\n" + "\n".join(dedup_chunk_contents_list)
             
             ircot_prompt = f"""
-                            You are an expert knowledge assistant using iterative retrieval with chain-of-thought reasoning.
-                            
-                            Current Question: {current_query}
-                            
-                            Available Knowledge Context:
-                            {context}
-                            
-                            Previous Thoughts: {' | '.join(thoughts) if thoughts else 'None'}
-                            
-                            Step {step}: Please think step by step about what additional information you need to answer the question completely and accurately.
-                            
-                            Instructions:
-                            1. Analyze the current knowledge context and the question
-                            2. Consider the initial analysis from noagent mode (if available in previous thoughts)
-                            3. Think about what information might be missing or unclear
-                            4. If you have enough information to answer, in the end of your response, write "So the answer is:" followed by your final answer
-                            5. If you need more information, in the end of your response, write a specific query begin with "The new query is:" to retrieve additional relevant information
-                            6. Be specific and focused in your reasoning
-                            7. Build upon the initial analysis to provide deeper insights
-                            
-                            Your reasoning:
-                            """
+You are an expert knowledge assistant using iterative retrieval with chain-of-thought reasoning. 
+You are provided with a question and knowledge context retrieved by a retriever based on the question.
+
+Current Question: {current_query}
+
+Knowledge Context Retrieved by the Current Question, based on entity match and semantic similarity:
+
+{context}
+
+Previous Thoughts: {' | '.join(thoughts) if thoughts else 'None'}
+
+
+Step {step}: Please think step by step about what additional information you
+need to answer the question completely and accurately.
+
+
+Instructions:
+
+1. Analyze the current knowledge context and the question
+
+2. Think about what information might be missing or unclear
+
+3. If you have enough information to answer, in the end of your response, write
+"So the answer is:" followed by your final answer
+
+4. If you need more information, in the end of your response, write a specific
+query begin with "The new query is:" to retrieve additional relevant information. 
+Fully utilize the retrieved knowledge and previous thoughts to generate as many entities that might help you answer the question as possible.
+
+5. Be specific and focused in your reasoning
+
+
+Your reasoning:"""
             max_retries = 20
             response = None
             for retry in range(max_retries):
@@ -491,25 +521,34 @@ def agent_retrieval(graphq, kt_retriever, qa_pairs, schema_path):
                 retrieval_results, time_taken = kt_retriever.process_retrieval_results(current_query)
                 total_time += time_taken
                 
-                new_triples = retrieval_results.get('triples', []) or []
+                for h, r, t, score in retrieval_results.get('raw_scored_triples', []):
+                    if score > all_raw_triples.get((h, r, t), -1.0):
+                        all_raw_triples[(h, r, t)] = score
+                ppr = retrieval_results.get('ppr_scores', {})
+                if ppr:
+                    latest_ppr_scores = ppr
+                kw = retrieval_results.get('keywords', [])
+                if kw:
+                    latest_keywords = kw
                 new_chunk_ids = retrieval_results.get('chunk_ids', []) or []
                 new_chunk_contents = retrieval_results.get('chunk_contents', {}) or {}
-                
-                new_chunk_contents_dict = new_chunk_contents
-                
-                all_triples.update(new_triples)
                 all_chunk_ids.update(new_chunk_ids)
-                all_chunk_contents.update(new_chunk_contents_dict)
-                
-                logger.info(f"Retrieved {len(new_triples)} new triples, {len(new_chunk_ids)} new chunks")
+                all_chunk_contents.update(new_chunk_contents)
+
+                logger.info(f"Retrieved {len(all_raw_triples)} total triples, {len(new_chunk_ids)} new chunks")
             else:
                 logger.info("No new query generated, stopping IRCoT")
                 break
             
             step += 1
         
-        final_context = "=== Final Triples ===\n" + "\n".join(deduplicate_triples(list(all_triples)))
-        final_context += "\n=== Final Chunks ===\n" + "\n".join(merge_chunk_contents(list(set(all_chunk_ids)), all_chunk_contents))
+        final_triples = kt_retriever.rerank_and_format_triples(
+            all_raw_triples, latest_ppr_scores, config.retrieval.top_k_graph, current_query
+        )
+        final_triples = filter_by_entities(final_triples, latest_keywords)
+        final_chunks = filter_by_entities(merge_chunk_contents(list(all_chunk_ids), all_chunk_contents), latest_keywords)
+        final_context = "=== Final Triples ===\n" + "\n".join(final_triples)
+        final_context += "\n=== Final Chunks ===\n" + "\n".join(final_chunks)
         
         final_prompt = kt_retriever.generate_prompt(qa["question"], final_context)
         
@@ -529,7 +568,7 @@ def agent_retrieval(graphq, kt_retriever, qa_pairs, schema_path):
         logger.info(f"========== Original Question: {qa['question']} ==========") 
         logger.info(f"Noagent Initial Answer: {initial_result['initial_answer']}")
         logger.info(f"IRCoT Steps: {len(thoughts)}")
-        logger.info(f"Final Triples: {len(deduplicate_triples(list(all_triples)))}")
+        logger.info(f"Final Triples: {len(final_triples)}")
         logger.info(f"Final Chunks: {len(merge_chunk_contents(list(set(all_chunk_ids)), all_chunk_contents))}")
         logger.info(f"Gold Answer: {qa['answer']}")
         logger.info(f"Generated Answer: {answer}")
